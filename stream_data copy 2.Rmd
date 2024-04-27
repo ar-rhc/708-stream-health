@@ -1,0 +1,442 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+```{r setup, message=FALSE, warning=FALSE}
+library(streamMetabolizer)
+library(readxl)
+library(lubridate)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(zoo)
+library(TTR)
+library(ggpubr)
+
+```
+
+
+```{r raw data compile}
+
+colname_light <- c("measure_time", "air_temp", "lux")
+colname_raw <- c("UNIX","UTC", "measure_time", "Battery", "water_temp", "DO", "DOS", "Q")
+
+d_raw <- read.csv("./Stream Data/raw_Data/Dundale_rawData.csv", skip = 6, header = TRUE, col.names = colname_raw, stringsAsFactors = FALSE)
+d_light <- read.csv("./Stream Data/raw_Data/dundale_light_rawData.csv", skip = 1, header = TRUE,col.names = colname_light, stringsAsFactors = FALSE)
+o_raw <- read.csv("./Stream Data/raw_Data/Olympic_rawData.csv", skip = 6, header = TRUE, col.names = colname_raw, stringsAsFactors = FALSE)
+o_light <- read.csv("./Stream Data/raw_Data/Olympic_light_rawData.csv", skip = 1, header = TRUE, col.names = colname_light, stringsAsFactors = FALSE)
+
+## Dundale Data
+d_raw <- d_raw[-1,]
+d_raw_new <- d_raw |>
+  mutate(measure_time = as.POSIXct(measure_time, tz='Pacific/Auckland'),
+         time_rounded = measure_time
+         )
+
+d_light <- d_light[-1,]
+d_light_new <- d_light |> 
+  mutate(measure_time = as.POSIXct(measure_time, format = "%m/%d/%y %I:%M:%S %p"),
+         time_rounded = measure_time - minutes(4) - seconds(17),
+         lux_smoothed = ifelse(lux > 10000, NA, lux)
+         ) |>
+  mutate(lux_smoothed = ifelse(is.na(lux_smoothed),
+                               zoo::rollmean(lux_smoothed, 2, fill = 'extend'),
+                               lux_smoothed),
+         lux_smoothed = SMA(lux_smoothed, n = 2)
+         )
+d_light
+d_light_new
+## test to see difference between Moving average and original
+#ggplot(d_light_new, aes(x = time_rounded)) +
+#  geom_line(aes(y = lux, color = "Original")) +
+#  geom_line(aes(y = lux_smoothed, color = "Smoothed")) +
+#  geom_line(aes(y = lux_smoothed_5, color = "Smoothed_5")) +
+#  labs(x = "Time", y = "Lux", color = "Series")+
+#  scale_x_datetime(limits = as.POSIXct(c("2024-03-29 12:00", "2024-03-29 19:00")))
+
+## Olympic Data
+o_raw <- o_raw[-1,]
+o_raw_new <- o_raw |>
+  mutate(measure_time = as.POSIXct(measure_time, tz='Pacific/Auckland'),
+         time_rounded = measure_time)
+
+o_light <- o_light[-1,]
+o_light_new <- o_light |>
+  mutate(measure_time = as.POSIXct(measure_time, format = "%m/%d/%y %I:%M:%S %p"),
+         time_rounded = measure_time - minutes(1) - seconds(4), 
+         lux_smoothed = ifelse(lux > 10000, NA, lux)
+         )|>
+  mutate(lux_smoothed = ifelse(is.na(lux_smoothed),
+                               zoo::rollmean(lux_smoothed, 2, fill = 'extend'),
+                               lux_smoothed),
+         lux_smoothed = SMA(lux_smoothed, n = 3)
+         )
+
+
+## Joining Light and DO data for both streams
+c_dundale <- d_raw_new |>
+  left_join(d_light_new, by = c("time_rounded")) |>
+  select(time_rounded, water_temp, air_temp, DO, DOS, Q, lux_smoothed) 
+c_olympics <- o_raw_new |>
+  left_join(o_light_new, by = c("time_rounded")) |>
+  select(time_rounded, water_temp, air_temp, DO, DOS, Q, lux_smoothed)
+
+c_olympics
+c_dundale
+
+head(c_olympics)
+tail(c_olympics)
+
+```
+
+```{r time difference}
+
+#cutofftime <- as.POSIXct("2024-04-08 16:31:07", tz = 'Pacific/Auckland')
+#cutofftime_diff <- difftime(as.POSIXct("2024-03-29 13:04:04"), as.POSIXct("2024-03-29 11:40:07"), units = "secs")
+#cutofftime <- cutofftime - cutofftime_diff
+#cutofftime
+```
+
+
+
+```{r combined data for sM format}
+
+## Olympics: Rename column names for sM package
+c_olympics_mf <- c_olympics |>
+  rename(DO.obs = DO,
+         DO.pctsat = DOS,
+         temp.water = water_temp,
+         temp.air = air_temp,
+         light = lux_smoothed) |>
+  mutate(time_rounded = force_tz(time_rounded, tzone = "Pacific/Auckland"),
+         solar.time = calc_solar_time(time_rounded, longitude = 174.763336), 
+         depth = 0.5,
+         DO.obs = as.numeric(DO.obs),
+         DO.pctsat = as.numeric(DO.pctsat),
+         temp.water = as.numeric(temp.water)
+         ) |>
+  ## Had to use UTC as calc_solar_time somehow transform the time from NZ to UTC again
+  ## solar.time is 1hr24min ahead of NZT
+  filter(solar.time > as.POSIXct("2024-03-29 11:40:00", tz = "Pacific/Auckland"), 
+         solar.time < as.POSIXct("2024-04-08 15:07:10", tz = "Pacific/Auckland")) |> 
+  mutate(DO.sat = 100 * (DO.obs / DO.pctsat),
+           site = "c_olympics") |>
+  select(solar.time, DO.obs, DO.sat,DO.pctsat, depth, temp.water, light, site )
+#str(c_olympics_mf)
+
+## Dundale: Rename column names for sM package
+c_dundale_mf <- c_dundale |>
+  rename(DO.obs = DO,
+         DO.pctsat = DOS,
+         temp.water = water_temp,
+         temp.air = air_temp,
+         light = lux_smoothed) |>
+  mutate(time_rounded = force_tz(time_rounded, tzone = "Pacific/Auckland"),
+         solar.time = calc_solar_time(time_rounded, longitude = 174.763336), 
+         depth = 0.25, 
+         DO.obs = as.numeric(DO.obs),
+         DO.pctsat = as.numeric(DO.pctsat),
+         temp.water = as.numeric(temp.water)
+         ) |>
+  filter(solar.time > as.POSIXct("2024-03-29 11:40:00", tz = "Pacific/Auckland"), 
+       solar.time < as.POSIXct("2024-04-08 15:07:10", tz = "Pacific/Auckland")) |> 
+  mutate(DO.sat = 100 * (DO.obs / DO.pctsat),
+         site = "c_dundale") |>
+  select(solar.time, DO.obs, DO.sat,DO.pctsat, depth, temp.water, light, site )
+
+c_olympics_mf
+c_dundale_mf
+
+## Combining data from two streams
+stream_data_combined <- bind_rows(c_olympics_mf, c_dundale_mf)
+
+
+#head(stream_data_combined)
+#tail(stream_data_combined)
+```
+
+```{r general data vis, fig.width=7, fig.height=10}
+## Ploty plots
+stream_plot <- stream_data_combined |>
+  gather(type, value, c(DO.obs, DO.pctsat, depth, temp.water, light)) |>
+  ggplot(aes(x = solar.time, y = value, color = site)) +
+  geom_line() +
+  facet_wrap(~ type, ncol = 1, scales = "free_y", labeller = labeller(
+    type = c(
+      "DO.obs" = "DO (mg/L)",
+      "DO.pctsat" = "DO Sat (%)",
+      "depth" = "Depth (m)",
+      "temp.water" = "Water Temp (°C)",
+      "light" = "Light (umol/m2/s)"
+    ))) +
+  theme_bw() +
+  scale_color_discrete('Stream Site')
+
+stream_plot
+
+
+```
+```{r Light plot, fig.width=16, fig.height=6}
+## Ploty plots
+stream_plot <- stream_data_combined |>
+  gather(type, value, c(temp.water)) |>
+  ggplot(aes(x = solar.time, y = value, color = site)) +
+  geom_line() +
+  facet_wrap(~ type, ncol = 1, scales = "free_y", labeller = labeller(
+    type = c(
+      "temp.water" = "Water Temp (°C)",
+      "light" = "Light (umol/m2/s)"
+    ))) +
+  theme_bw() +
+  scale_color_discrete('Stream Site')
+
+stream_plot
+
+
+```
+
+```{r O2 plot, fig.width=16, fig.height=6}
+## Ploty plots
+stream_plot <- stream_data_combined |>
+  gather(type, value, c(DO.obs, DO.pctsat)) |>
+  ggplot(aes(x = solar.time, y = value, color = site)) +
+  geom_line() +
+  facet_wrap(~ type, ncol = 2, scales = "free_y", labeller = labeller(
+    type = c(
+      "DO.obs" = "DO (mg/L)",
+      "DO.pctsat" = "DO Sat (%)"
+    ))) +
+  theme_bw() +
+  scale_color_discrete('Stream Site')
+
+stream_plot
+
+
+```
+
+
+
+
+```{r data_needs}
+## Display data needs for sM package
+metab_inputs('mle', 'data')
+```
+
+```{r removing error data}
+
+## Removing data entry with wrong time order 
+decreasing_time_rows <- which(diff(c_olympics_mf$solar.time) < 0)
+repeating_time_rows <- which(duplicated(c_olympics_mf$solar.time))
+decreasing_time_rows
+repeating_time_rows
+valid_rows <- setdiff(seq_len(nrow(c_olympics_mf)), c(decreasing_time_rows, repeating_time_rows))
+c_olympics_mf_clean <- c_olympics_mf[valid_rows, ] |>
+  select(-site, -DO.pctsat)
+
+#c_olympics_mf_day <- c_olympics_mf_clean |>
+#  mutate(time = hms(format(solar.time, "%H:%M:%S"))) |>
+#  filter(time >= hms("08:30:00") & time <= hms("16:30:00")) |>
+#  select(-time)
+#c_olympics_mf_day
+
+decreasing_time_rows <- which(diff(c_dundale_mf$solar.time) < 0)
+repeating_time_rows <- which(duplicated(c_dundale_mf$solar.time))
+decreasing_time_rows
+repeating_time_rows
+valid_rows <- setdiff(seq_len(nrow(c_dundale_mf)), c(decreasing_time_rows, repeating_time_rows))
+c_dundale_mf_clean <- c_dundale_mf[valid_rows, ] |>
+  select(-site, -DO.pctsat)
+
+#c_dundale_mf_day <- c_dundale_mf_clean |>
+#  mutate(time = hms(format(solar.time, "%H:%M:%S"))) |>
+#  filter(time >= hms("08:30:00") & time <= hms("16:30:00")) |>
+#  select(-time)
+#c_dundale_mf_day
+
+
+```
+
+```{r}
+bayes_name <- mm_name(type='bayes', pool_K600='none', err_obs_iid=TRUE, err_proc_iid=TRUE)
+bayes_name
+bayes_specs <- specs(bayes_name)
+bayes_specs
+# one way to alter specifications: call specs() again
+bayes_specs <- specs(bayes_name, burnin_steps=500, saved_steps=200, n_cores=1, GPP_daily_mu=3, GPP_daily_sigma=2)
+
+mm_d <- metab(bayes_specs, data=c_dundale_mf_clean)
+mm_o <- metab(bayes_specs, data=c_olympics_mf_clean)
+
+df_d <- predict_metab(mm_d)
+df_o <- predict_metab(mm_o)
+
+
+```
+
+```{r}
+p1 <- plot_metab_preds(
+  mm_d, y_var = c("GPP", "ER"), y_lim = list(GPP = c(-5, 5), ER = c(-20, 5))
+)
+
+p2 <- plot_metab_preds(
+  mm_o, y_var = c("GPP", "ER"), y_lim = list(GPP = c(-5, 5), ER = c(-20, 5))
+)
+
+multi_plot <- ggarrange(p1, p2)
+multi_plot
+```
+
+```{r}
+ggplot(mm_d, aes(x = date)) +
+  geom_line(aes(y = GPP_lower), color = "green") +
+  geom_line(aes(y = GPP_upper), color = "green") +
+  geom_errorbar(aes(ymin = GPP_lower, ymax = GPP_upper), width = 0.2, color = "green") +
+  
+#  geom_line(aes(y = ER_lower), color = "brown") +
+#  geom_line(aes(y = ER_upper), color = "brown") +
+#  geom_errorbar(aes(ymin = ER_lower, ymax = ER_upper), width = 0.2, color = "brown") +
+  
+#  facet_wrap(~ site, ncol = 1) +
+  labs(x = "Date", y = "Predictions") +
+  theme_classic()
+```
+
+
+
+
+
+```{r olympics gpp}
+
+library(ggplot2)
+# Add 'site' column to df_classic_o
+df_o <- df_o |>
+  mutate(site = "Olympics") 
+
+# Add 'site' column to df_classic_d
+df_d <- df_d |>
+  mutate(site = "Dundale")
+
+# Combine the data from both streams into a single data frame
+combined_data <- rbind(df_o, df_d) |>
+  select(-msgs.fit, -warnings, -errors)
+combined_data
+
+```
+
+
+
+```{r gpp plot}
+combined_data_long <- combined_data |>
+  tidyr::pivot_longer(cols = c("GPP", "ER","GPP.lower", "GPP.upper", "ER.lower","ER.upper"),
+                      names_to = "variable",
+                      values_to = "value")
+combined_data_long
+#outliers <- combined_data_long |>
+#  group_by(variable) |>
+#  arrange(desc(abs(value))) |>
+#  slice(1:2)
+
+# Remove the outliers from the data
+#combined_data_long_filtered <- combined_data_long |>
+#  anti_join(outliers, by = c("variable", "date", "site", "value"))
+
+# Create the plot
+ggplot(combined_data_long, aes(x = date, y = value, color = site)) +
+  geom_line() +
+  
+  #geom_errorbar(aes(ymin = GPP.lower, ymax = GPP.upper)) +
+  #geom_errorbar(aes(ymin = ER.lower, ymax = ER.upper)) +
+  #facet_wrap(~variable, ncol = 1, scales = "free_y") +
+  facet_wrap(~factor(variable, c("GPP","ER")), ncol = 1, scales = "free_y") +
+  scale_color_manual(name = "Stream", values = c("Olympics" = "blue", "Dundale" = "red")) +
+  labs(x = "Date", y = "Value", title = "GPP and ER Comparison") +
+  theme_minimal() 
+  #scale_x_date(limits = c(start_date, end_date), date_labels = "%b %d") 
+```
+
+```{r}
+combined_data
+p11 <- ggplot(combined_data, aes(x = date)) +
+  geom_line(aes(y = GPP), color = "darkgreen", linewidth = 0.8) +
+  geom_errorbar(aes(ymin = GPP.lower, ymax = GPP.upper), width = 0.2, color = "green") +
+ 
+  #geom_line(aes(y = ER), color = "brown") +
+  #geom_errorbar(aes(ymin = ER.lower, ymax = ER.upper), width = 0.2, color = "brown") +  
+  
+  facet_wrap(~ site, ncol = 2) +
+  labs(x = "", y = "GPP") +
+  scale_x_date(date_labels = "") +
+  xlim(as.Date("2024-03-29"), as.Date("2024-04-06")) +
+  theme_minimal() +
+  theme(axis.title.x=element_blank(),
+      axis.text.x=element_blank(),
+      axis.ticks.x=element_blank())
+ 
+p22 <- ggplot(combined_data, aes(x = date)) +
+#  geom_line(aes(y = GPP), color = "darkgreen") +
+#  geom_errorbar(aes(ymin = GPP.lower, ymax = GPP.upper), width = 0.2, color = "lightgreen") +
+ 
+  geom_line(aes(y = ER), color = "#4B0092", linewidth = 0.8) +
+  geom_errorbar(aes(ymin = ER.lower, ymax = ER.upper), width = 0.2, color = "#4B0092") +  
+  xlim(as.Date("2024-03-29"), as.Date("2024-04-06")) +
+  facet_wrap(~ site, ncol = 2) +
+  labs(x = "Date", y = "ER") +
+  theme_minimal()+
+  theme(strip.text.x = element_blank()
+  )
+
+multi_plot2 <- ggarrange(p11, p22, ncol = 1)
+multi_plot2
+```
+
+```{r}
+combined_data_long <- combined_data |>
+  tidyr::pivot_longer(cols = c("GPP", "ER","GPP.lower", "GPP.upper", "ER.lower","ER.upper"),
+                      names_to = "variable",
+                      values_to = "value")
+combined_data_long
+ 
+ggplot(combined_data_long, aes(x = date)) +
+  geom_line(data = filter(combined_data_long, variable %in% c("GPP", "ER")), aes(y = value, color = variable), linewidth = 0.8) +
+  geom_errorbar(data = filter(combined_data_long, variable %in% c("GPP.lower", "GPP.upper")),
+                aes(ymin = value, ymax = lead(value)), width = 0.2, color = "green") +
+  geom_errorbar(data = filter(combined_data_long, variable %in% c("ER.lower", "ER.upper")),
+                aes(ymin = value, ymax = lead(value)), width = 0.2, color = "#4B0092") +
+  facet_grid(variable ~ site) +
+  labs(x = "Date", y = "Value") +
+  scale_color_manual(values = c("darkgreen", "#4B0092"), labels = c("GPP", "ER")) +
+  scale_x_date(date_labels = "") +
+  xlim(as.Date("2024-03-29"), as.Date("2024-04-06")) +
+  theme_minimal() +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.text.x = element_blank(),
+        legend.position = "top")
+```
+
+
+
+
+
+```{r}
+library(streamMetabolizer)
+dat <- data_metab(num_days='3', res='15')
+
+dat 
+```
+
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Cmd+Option+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Cmd+Shift+K* to preview the HTML file). 
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
